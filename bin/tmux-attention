@@ -1,0 +1,212 @@
+#!/bin/sh
+set -e
+
+get_default_cache_dir() {
+	if [ -n "${XDG_CACHE_HOME-}" ]; then
+		echo "$XDG_CACHE_HOME"
+	elif [ "$(uname)" = "Darwin" ]; then
+		echo "$HOME/Library/Caches"
+	else
+		echo "$HOME/.cache"
+	fi
+}
+
+cache_dir="$(get_default_cache_dir)"
+cachefile="$cache_dir/tmux-attention"
+
+ensure_cachefile() {
+	mkdir -p "$cache_dir"
+	[ -f "$cachefile" ] || : >"$cachefile"
+}
+
+in_tmux() { [ -n "${TMUX-}" ]; }
+
+get_target() {
+	if [ -n "${TMUX_PANE-}" ]; then
+		tmux display -p -t "$TMUX_PANE" '#{session_name}=#{session_path}:#{window_index}.#{pane_index}'
+	else
+		tmux display -p '#{session_name}=#{session_path}:#{window_index}.#{pane_index}'
+	fi
+}
+
+dedupe() {
+	tmpfile="$(mktemp)"
+	awk '!seen[$0]++' "$cachefile" >"$tmpfile"
+	mv "$tmpfile" "$cachefile"
+}
+
+remove_exact_line() {
+	line="$1"
+	tmpfile="$(mktemp)"
+	awk -v line="$line" '$0 != line' "$cachefile" >"$tmpfile"
+	mv "$tmpfile" "$cachefile"
+}
+
+_get_fzf_cmd() {
+	if ! type fzf >/dev/null 2>&1; then
+		echo "tmux-attention depends on fzf" >&2
+		exit 1
+	fi
+	fzf_version="$(fzf --version | cut -d ' ' -f1)"
+	required_version="0.53.0"
+	version_ge() { [ "$(printf '%s\n' "$@" | sort -V | head -n1)" = "$1" ]; }
+	if version_ge "$required_version" "$fzf_version"; then
+		echo "fzf --tmux 50%"
+		return 0
+	fi
+	if type fzf-tmux >/dev/null 2>&1; then
+		echo "fzf-tmux -p '50%,50%'"
+		return 0
+	fi
+	echo "fzf"
+}
+
+list_sessions() { tmux ls -F '#{session_name}=#{session_path}'; }
+
+sessions_has_match() { list_sessions | grep -wq "^$1"; }
+
+switch_to_target() {
+	line="$1"
+	name="${line%%=*}"
+	path="${line#*=}"
+	dirpath="${path%%:*}"
+	pane="${path#*:}"
+	[ "$dirpath" = "$pane" ] && pane=""
+
+	tmux_base_index="$(tmux show-option -gqv base-index 2>/dev/null || echo 0)"
+	tmux_pane_base_index="$(tmux show-option -gqv pane-base-index 2>/dev/null || echo 0)"
+
+	if ! sessions_has_match "$name=$dirpath"; then
+		if [ "$(uname)" = "Darwin" ]; then sedi="sed -i ''"; else sedi="sed -i"; fi
+		$sedi "s|^$name=.*|$name=$dirpath:$tmux_base_index.$tmux_pane_base_index|" "$cachefile"
+		tmux new -ds "$name" -c "$dirpath"
+	fi
+	exec tmux switch-client -t "$name:${pane:-$tmux_base_index.$tmux_pane_base_index}"
+}
+
+cmd_add() {
+	in_tmux || exit 0
+	test_mode=0
+	for arg in "$@"; do
+		case "$arg" in
+			--test) test_mode=1 ;;
+		esac
+	done
+	if [ "$test_mode" -ne 1 ]; then
+		if [ -n "${TMUX_PANE-}" ]; then
+			current_pane_id="$(tmux display -p -t "$TMUX_PANE" '#{pane_id}')"
+		else
+			current_pane_id="$(tmux display -p '#{pane_id}')"
+		fi
+		if tmux list-clients -F '#{pane_id}' 2>/dev/null | grep -qx "$current_pane_id"; then
+			exit 0
+		fi
+	fi
+	ensure_cachefile
+	target="$(get_target)"
+	printf '%s\n' "$target" >>"$cachefile"
+	dedupe
+}
+
+cmd_list() {
+	in_tmux || exit 0
+	ensure_cachefile
+
+	FZF_CMD="$(_get_fzf_cmd)"
+	set +e
+	entry="$(awk -v home="$HOME" -v bold="$(tput setaf 4)" -v sgr0="$(tput sgr0)" '{
+		raw = $0
+		split($0, parts, "=")
+		name = parts[1]
+		rest = parts[2]
+		winpane = rest
+		sub(/^.*:/, "", winpane)
+		if (winpane != rest) {
+			name = name ":" winpane
+		}
+		sub(home "/", "", rest)
+		printf "%s\t%s%s%s %s\n", raw, bold, name, sgr0, rest
+	}' "$cachefile" | $FZF_CMD --ansi --delimiter='\t' --with-nth=2)"
+	status=$?
+	set -e
+	[ "$status" -eq 0 ] || exit 0
+	[ -n "$entry" ] || exit 0
+	raw="$(printf '%s' "$entry" | cut -f1)"
+	switch_to_target "$raw"
+}
+
+cmd_jump_first() {
+	in_tmux || exit 0
+	ensure_cachefile
+	[ -s "$cachefile" ] || exit 0
+	raw="$(head -n 1 "$cachefile")"
+	switch_to_target "$raw"
+}
+
+cmd_clear_current() {
+	in_tmux || exit 0
+	ensure_cachefile
+	target="$(get_target)"
+	remove_exact_line "$target"
+}
+
+cmd_clear() {
+	ensure_cachefile
+	[ -n "${1-}" ] || { echo "clear requires a target line" >&2; exit 1; }
+	remove_exact_line "$1"
+}
+
+cmd_status() {
+	ensure_cachefile
+	[ -s "$cachefile" ] || exit 0
+	first_line="$(awk 'NF{print; exit}' "$cachefile")"
+	[ -n "$first_line" ] || exit 0
+	name="${first_line%%=*}"
+	rest="${first_line#*=}"
+	winpane="${rest##*:}"
+	[ "$winpane" = "$rest" ] && winpane=""
+	if [ -n "$winpane" ]; then
+		name="${name}:${winpane}"
+	fi
+	count="$(awk 'NF{c++} END{print c+0}' "$cachefile")"
+	if [ "$count" -le 1 ]; then
+		printf '%s' "$name"
+	else
+		printf '%s +%s' "$name" "$((count - 1))"
+	fi
+}
+
+help() {
+	cat <<'EOF'
+Usage:
+  tmux-attention [command]
+
+Commands:
+  add [--test]    Track current tmux session+pane (default)
+  list            Fuzzy-pick and jump to a tracked entry
+  jump-first      Jump to the oldest tracked entry
+  clear-current   Clear the current session+pane entry
+  clear <target>  Clear an entry by exact target line
+  status          Print next session name and count (for status bar)
+  help            Show this help
+EOF
+}
+
+main() {
+	cmd="${1:-add}"
+	case "$cmd" in
+		add)
+			[ "${1-}" = "add" ] && shift
+			cmd_add "$@"
+			;;
+		list) cmd_list ;;
+		jump-first) cmd_jump_first ;;
+		clear-current) cmd_clear_current ;;
+		clear) shift; cmd_clear "$@" ;;
+		status) cmd_status ;;
+		help|-h|--help) help ;;
+		*) help; exit 1 ;;
+	esac
+}
+
+main "$@"
